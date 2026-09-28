@@ -12,7 +12,12 @@ except Exception:
 
 def run(cmd, check=True, capture_output=True, text=True):
     print("➤", " ".join(cmd))
-    return subprocess.run(cmd, check=check, capture_output=capture_output, text=text)
+    try:
+        return subprocess.run(cmd, check=check, capture_output=capture_output, text=text)
+    except subprocess.CalledProcessError as e:
+        if e.stderr:
+            print(e.stderr.strip(), file=sys.stderr)
+        raise
 
 
 def which_or_die(bin_name: str):
@@ -80,6 +85,74 @@ def ass_timestamp(t: float) -> str:
     s = cs // 100
     cs = cs % 100
     return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+CONTRACTION_SUFFIX = r"'(?:s|t|re|ve|ll|d|m|em|cause|til|tis)\b"
+PUNCT_SPACE_RE = re.compile(r"\s+([,.!?;:]|" + CONTRACTION_SUFFIX + r")", re.IGNORECASE)
+CONTRACTION_TOKEN_RE = re.compile(r"^" + CONTRACTION_SUFFIX, re.IGNORECASE)
+
+
+def tidy_punct_spacing(text: str) -> str:
+    """Remove whitespace inserted before punctuation and contraction
+    suffixes (e.g. "else 's" -> "else's") by word-by-word joins."""
+    return PUNCT_SPACE_RE.sub(r"\1", text)
+
+
+def is_punct_only(token: str) -> bool:
+    return bool(re.fullmatch(r"[,.!?;:]+", token))
+
+
+def attaches_to_previous(token: str) -> bool:
+    """Whether this word token should never be separated from the previous
+    one by a space or a line break (punctuation, contraction suffixes)."""
+    return is_punct_only(token) or bool(CONTRACTION_TOKEN_RE.match(token))
+
+
+SRT_TIME_RE = re.compile(r"(\d+):(\d{2}):(\d{2}),(\d{3})")
+
+
+def parse_srt_timestamp(ts: str) -> float:
+    m = SRT_TIME_RE.match(ts.strip())
+    if not m:
+        raise ValueError(f"Invalid SRT timestamp: {ts}")
+    h, m_, s, ms = (int(x) for x in m.groups())
+    return h * 3600 + m_ * 60 + s + ms / 1000.0
+
+
+def write_srt(sentences: List[Dict], path: str):
+    lines = []
+    for i, s in enumerate(sentences, start=1):
+        lines.append(str(i))
+        lines.append(f"{srt_timestamp(s['start'])} --> {srt_timestamp(s['end'])}")
+        lines.append(s["text"])
+        lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def parse_srt(path: str) -> List[Dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    blocks = re.split(r"\n\s*\n", content.strip())
+    entries = []
+    for block in blocks:
+        lines = [ln for ln in block.splitlines() if ln.strip() != ""]
+        time_line_idx = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        if time_line_idx is None:
+            continue
+        start_str, end_str = (p.strip() for p in lines[time_line_idx].split("-->"))
+        text = tidy_punct_spacing(" ".join(lines[time_line_idx + 1 :]).strip())
+        if not text:
+            continue
+        entries.append(
+            {
+                "start": parse_srt_timestamp(start_str),
+                "end": parse_srt_timestamp(end_str),
+                "text": text,
+            }
+        )
+    entries.sort(key=lambda e: e["start"])
+    return entries
 
 
 def sanitize_for_ffmpeg_filter(path: str) -> str:
@@ -257,7 +330,7 @@ def segment_words(segments: List[Dict]) -> List[Dict]:
         words = seg.get("words") or []
         if not words:
             text = seg.get("text", "").strip()
-            tokens = [t for t in re.findall(r"\w+|\S", text) if t.strip()]
+            tokens = [t for t in re.findall(r"\w+(?:'\w+)*|\S", text) if t.strip()]
             dur = max(0.001, seg["end"] - seg["start"])
             if tokens:
                 step = dur / len(tokens)
@@ -303,7 +376,9 @@ def extract_sentences(segments: List[Dict]) -> List[Dict]:
             cur.append(w)
             token = (w["word"] or "").strip()
             if token.endswith((".", "!", "?")):
-                txt = re.sub(r"\s+", " ", " ".join(x["word"] for x in cur)).strip()
+                txt = tidy_punct_spacing(
+                    re.sub(r"\s+", " ", " ".join(x["word"] for x in cur)).strip()
+                )
                 sentences.append(
                     {
                         "start": sent_start,
@@ -315,7 +390,9 @@ def extract_sentences(segments: List[Dict]) -> List[Dict]:
                 cur = []
                 sent_start = None
         if cur:
-            txt = re.sub(r"\s+", " ", " ".join(x["word"] for x in cur)).strip()
+            txt = tidy_punct_spacing(
+                re.sub(r"\s+", " ", " ".join(x["word"] for x in cur)).strip()
+            )
             sentences.append(
                 {
                     "start": sent_start if sent_start is not None else seg["start"],
@@ -600,11 +677,11 @@ def sentences_to_ass_bottom(
                 continue
             st = max(clip_start, sel[0]["start"])
             en = min(clip_end, sel[-1]["end"])
-            text = " ".join(w["word"] for w in sel).strip()
+            text = tidy_punct_spacing(" ".join(w["word"] for w in sel).strip())
         else:
             st = max(clip_start, s["start"])
             en = min(clip_end, s["end"])
-            text = s["text"].strip()
+            text = tidy_punct_spacing(s["text"].strip())
         st_rel = max(0.0, (st - clip_start) - pad_pre)
         en_rel = min(clip_len, (en - clip_start) + pad_post)
         if en_rel - st_rel < 0.20 or not text:
@@ -634,7 +711,7 @@ ScriptType: v4.00+
 PlayResX: {target_w}
 PlayResY: {target_h}
 ScaledBorderAndShadow: yes
-WrapStyle: 2
+WrapStyle: 0
 Collisions: Normal
 
 [V4+ Styles]
@@ -671,7 +748,7 @@ def sentences_to_ass_tiktok(
 ) -> str:
     """
     TikTok-style center captions:
-    - 1–3 word chunks with karaoke highlight (\k)
+    - 1–3 word chunks with karaoke highlight (\\k)
     - Non-overlapping: enforce minimum gap between chunks
     - Theming via colors dict (primary/accent/outline/box in hex)
     """
@@ -714,7 +791,7 @@ ScriptType: v4.00+
 PlayResX: {target_w}
 PlayResY: {target_h}
 ScaledBorderAndShadow: yes
-WrapStyle: 2
+WrapStyle: 0
 Collisions: Normal
 
 [V4+ Styles]
@@ -745,10 +822,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         punct_break = cur and (cur[-1]["word"].endswith((".", "!", "?", ",")))
         dur = last_end - cur_start
         if (
-            (pause > 0.35)
-            or punct_break
-            or (len(cur) >= chunk_max_words)
-            or (dur >= chunk_target_sec)
+            not attaches_to_previous((w["word"] or "").strip())
+            and (
+                (pause > 0.35)
+                or punct_break
+                or (len(cur) >= chunk_max_words)
+                or (dur >= chunk_target_sec)
+            )
         ):
             chunks.append({"start": cur_start, "end": last_end, "words": cur})
             cur_start = w["start"]
@@ -769,13 +849,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         parts = [
             r"{\an5\pos(540," + str(960 + center_offset) + r")}"
         ]  # center position
-        for w in ch["words"]:
+        for wi, w in enumerate(ch["words"]):
             dur_cs = int(round((w["end"] - w["start"]) * 100))
             if dur_cs <= 0:
                 dur_cs = 5
             token = (w["word"] or "").strip()
             token = token.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-            parts.append(r"{\k" + str(dur_cs) + "}" + token + " ")
+            lead = " " if (wi > 0 and not attaches_to_previous(token)) else ""
+            parts.append(lead + r"{\k" + str(dur_cs) + "}" + token)
         txt = "".join(parts).strip()
         events.append([st_rel, en_rel, txt])
 
@@ -917,12 +998,109 @@ def export_clip(
     subprocess.run(cmd, check=True)
 
 
+def run_subtitles_mode(args, colors: Dict[str, str]):
+    input_path = args.input
+    outdir = args.outdir
+    os.makedirs(outdir, exist_ok=True)
+    w, h, dur = ffprobe_stream_dims(input_path)
+    print(f"[Probe] {w}x{h}, duration {dur:.1f}s")
+
+    srt_path = os.path.join(outdir, "subtitles.srt")
+
+    if args.srt is None:
+        try:
+            segments = transcribe(input_path, args.model, args.prefer, args.device)
+        except Exception as e:
+            print("Transcription failed:", e)
+            sys.exit(1)
+        if not segments:
+            print("No transcription segments produced.")
+            sys.exit(1)
+        with open(
+            os.path.join(outdir, "transcript_segments.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(segments, f, indent=2, ensure_ascii=False)
+
+        sentences = extract_sentences(segments)
+        write_srt(sentences, srt_path)
+        print(f"[Done] Wrote subtitles to {srt_path}")
+        print(f"Review and edit that file, then re-run with --srt {srt_path} to render the final video.")
+        return
+
+    entries = parse_srt(args.srt)
+    if not entries:
+        print(f"No subtitle entries found in {args.srt}.")
+        sys.exit(1)
+    sentences_all = segment_words(entries)
+
+    face_center = detect_face_center(input_path, 0, dur, sample_count=24)
+    crop = compute_vertical_crop(face_center, w, h)
+
+    if args.caption_preset == "tiktok":
+        ass_text = sentences_to_ass_tiktok(
+            sentences_all,
+            0,
+            dur,
+            target_w=1080,
+            target_h=1920,
+            font=args.font,
+            fontsize=args.fontsize,
+            margin_h=args.margin_h,
+            center_offset=args.center_offset,
+            box_opacity=args.box_opacity,
+            chunk_max_words=args.chunk_words,
+            chunk_target_sec=args.chunk_sec,
+            chunk_gap=args.chunk_gap,
+            colors=colors,
+        )
+    else:
+        ass_text = sentences_to_ass_bottom(
+            sentences_all,
+            0,
+            dur,
+            target_w=1080,
+            target_h=1920,
+            style=args.caption_style,
+            box_opacity=args.box_opacity,
+            margin_v=args.margin_v,
+            margin_h=args.margin_h,
+            font=args.font,
+            fontsize=args.fontsize,
+            wrap_width=args.wrap_width,
+            chunk_gap=args.chunk_gap,
+            colors=colors,
+        )
+
+    ass_path = os.path.join(outdir, "subtitled.ass")
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_text)
+
+    out_mp4 = os.path.join(outdir, "subtitled.mp4")
+    export_clip(input_path, out_mp4, 0, dur, crop_rect=crop, ass_path=ass_path)
+    print(f"[Done] {out_mp4}")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Auto shorts with TikTok-style or bottom captions."
     )
     ap.add_argument("--input", required=True)
     ap.add_argument("--outdir", required=True)
+    ap.add_argument(
+        "--mode",
+        choices=["shorts", "subtitles"],
+        default="shorts",
+        help="'shorts' picks and exports clips (default). 'subtitles' burns captions "
+        "into the whole input video instead, with a review/edit step: run once "
+        "without --srt to transcribe and write outdir/subtitles.srt for you to "
+        "edit, then run again with --srt pointing at the edited file to render.",
+    )
+    ap.add_argument(
+        "--srt",
+        default=None,
+        help="Path to an edited subtitles SRT (subtitles mode, render step). "
+        "Omit to only generate outdir/subtitles.srt for review.",
+    )
     ap.add_argument("--num-shorts", type=int, default=10)
     ap.add_argument("--min-sec", type=int, default=15)
     ap.add_argument("--max-sec", type=int, default=58)
@@ -988,6 +1166,10 @@ def main():
 
     args = ap.parse_args()
 
+    if not os.path.isfile(args.input):
+        print(f"ERROR: input file not found: {args.input}")
+        sys.exit(1)
+
     # theme resolution
     colors = {
         "primary": "FFFFFF",
@@ -1011,6 +1193,10 @@ def main():
         colors["outline"] = args.color_outline
     if args.box_tint:
         colors["box"] = args.box_tint
+
+    if args.mode == "subtitles":
+        run_subtitles_mode(args, colors)
+        return
 
     input_path = args.input
     outdir = args.outdir

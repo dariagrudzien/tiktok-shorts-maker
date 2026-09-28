@@ -1,7 +1,16 @@
 # tiktok-shorts-maker
-Documentation TBA 
+Documentation TBA
 
-How to run: 
+How to run:
+
+1. Set your [Hugging Face token](https://huggingface.co/docs/hub/security-tokens) to avoid rate-limiting:
+
+```
+export HF_TOKEN=<token>
+```
+
+2. Create the short:
+
 ```
 python3 create_shorts.py \
   --input "input-video.mp4" --outdir "./shorts_out" \
@@ -11,6 +20,19 @@ python3 create_shorts.py \
   --chunk-gap 0.12 --theme white-blue \
   --box-opacity 0 \
   --prefer faster --model medium --device auto
+```
+
+3. Add subtitles to the whole video instead of picking shorts (with a review/edit
+   step in between):
+
+```
+# Step 1: transcribe and write outdir/subtitles.srt for you to review/edit
+python3 create_shorts.py --input "input-video.mp4" --outdir "./subs_out" --mode subtitles
+
+# Edit ./subs_out/subtitles.srt as needed, then render the final video:
+python3 create_shorts.py --input "input-video.mp4" --outdir "./subs_out" \
+  --mode subtitles --srt "./subs_out/subtitles.srt" \
+  --caption-preset tiktok --theme white-blue
 ```
 
 How to compile video with subs:
